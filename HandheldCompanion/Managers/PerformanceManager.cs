@@ -1,7 +1,6 @@
 using System;
 using System.Linq;
 using System.Runtime.InteropServices;
-using System.Threading;
 using System.Threading.Tasks;
 using System.Timers;
 using ControllerCommon;
@@ -64,7 +63,6 @@ public class PerformanceManager : Manager
     private double TDPMin;
     private int AutoTDPProcessId;
     private double AutoTDPTargetFPS;
-    private bool cpuWatchdogPendingStop;
     private uint currentEPP = 50;
     private double CurrentGfxClock;
 
@@ -76,7 +74,6 @@ public class PerformanceManager : Manager
     // GPU limits
     private double FallbackGfxClock;
     private readonly double[] FPSHistory = new double[6];
-    private bool gfxWatchdogPendingStop;
 
     private Processor processor;
     private double ProcessValueFPSPrevious;
@@ -144,11 +141,11 @@ public class PerformanceManager : Manager
         }
         else if (cpuWatchdog.Enabled)
         {
-            StopTDPWatchdog(true);
+            StopTDPWatchdog();
 
             // restore default TDP (if not AutoTDP is enabled)
             if (!profile.AutoTDPEnabled)
-                RestoreTDP(true);
+                RestoreTDP();
         }
 
         // apply profile defined AutoTDP
@@ -159,11 +156,11 @@ public class PerformanceManager : Manager
         }
         else if (autoWatchdog.Enabled)
         {
-            StopAutoTDPWatchdog(true);
+            StopAutoTDPWatchdog();
 
             // restore default TDP (if not manual TDP is enabled)
             if (!profile.TDPOverrideEnabled)
-                RestoreTDP(true);
+                RestoreTDP();
         }
 
         // apply profile defined GPU
@@ -174,7 +171,7 @@ public class PerformanceManager : Manager
         }
         else if (gfxWatchdog.Enabled)
         {
-            StopGPUWatchdog(true);
+            StopGPUWatchdog();
             RestoreGPUClock(true);
         }
 
@@ -190,22 +187,22 @@ public class PerformanceManager : Manager
         // restore default TDP
         if (profile.TDPOverrideEnabled)
         {
-            StopTDPWatchdog(true);
-            RestoreTDP(true);
+            StopTDPWatchdog();
+            RestoreTDP();
         }
 
         // restore default TDP
         if (profile.AutoTDPEnabled)
         {
-            StopAutoTDPWatchdog(true);
-            StopTDPWatchdog(true);
-            RestoreTDP(true);
+            StopAutoTDPWatchdog();
+            StopTDPWatchdog();
+            RestoreTDP();
         }
 
         // restore default GPU frequency
         if (profile.GPUOverrideEnabled)
         {
-            StopGPUWatchdog(true);
+            StopGPUWatchdog();
             RestoreGPUClock(true);
         }
 
@@ -217,10 +214,24 @@ public class PerformanceManager : Manager
         }
     }
 
-    private void RestoreTDP(bool immediate)
+    private void RestoreTDP()
     {
-        for (PowerType pType = PowerType.Slow; pType <= PowerType.Fast; pType++)
-            RequestTDP(pType, MainWindow.CurrentDevice.cTDP[1], immediate);
+        var device = MainWindow.CurrentDevice;
+
+        // Determine default TDP of device
+        double[] defaultTdp;
+        if (device.DefaultTDP != null)
+        {
+            defaultTdp = device.DefaultTDP;
+        }
+        else
+        {
+            // Use device max TDP as default
+            var maxDeviceTdp = device.cTDP[1];
+            defaultTdp = new[] {maxDeviceTdp, maxDeviceTdp, maxDeviceTdp};
+        }
+
+        RequestTDP(defaultTdp, true, false);
     }
 
     private void RestoreGPUClock(bool immediate)
@@ -401,8 +412,13 @@ public class PerformanceManager : Manager
             // set lock
             cpuLock = true;
 
-            var TDPdone = false;
-            var MSRdone = false;
+            // Get current TDP values
+            var currentTdp = CurrentTDP;    // Fallback to HWINFO provided values
+            if (processor is AMDProcessor amdProcessor &&
+                amdProcessor.TryGetTDPLimits(out var limits))
+            {
+                currentTdp = limits;
+            }
 
             // read current values and (re)apply requested TDP if needed
             foreach (var type in (PowerType[])Enum.GetValues(typeof(PowerType)))
@@ -414,50 +430,38 @@ public class PerformanceManager : Manager
                     break;
 
                 // Wanted TDP
-                var TDP = StoredTDP[idx];
+                var wantedTDP = StoredTDP[idx];
 
                 // Actual TDP
-                var ReadTDP = CurrentTDP[idx];
+                var actualTDP = currentTdp[idx];
 
-                if (processor is AMDProcessor amdProcessor)
+                if (processor is AMDProcessor)
                 {
                     // AMD reduces TDP by 10% when OS power mode is set to Best power efficiency
                     if (currentPowerMode == PowerMode.BetterBattery)
-                        TDP = (int)Math.Truncate(TDP * 0.9);
-
-                    // Try to use RyzenAdj to read actual TDP
-                    if (amdProcessor.TryGetTDPLimit(type, out var tdpLimit))
-                    {
-                        ReadTDP = tdpLimit;
-                    }
-
+                        wantedTDP = (int)Math.Truncate(wantedTDP * 0.9);
                 }
-                else if (processor.GetType() == typeof(IntelProcessor))
+                else if (processor is IntelProcessor)
                 {
                     // Intel doesn't have stapm
                     if (type == PowerType.Stapm)
                         continue;
                 }
 
-
-
-                if (ReadTDP != 0)
+                if (actualTDP != 0)
                     cpuWatchdog.Interval = INTERVAL_DEFAULT;
                 else
                     cpuWatchdog.Interval = INTERVAL_DEGRADED;
 
                 // only request an update if current limit is different than stored
-                if (Math.Abs(ReadTDP - TDP) > 0.001)
-                    processor.SetTDPLimit(type, TDP);
+                if (Math.Abs(actualTDP - wantedTDP) > 0.001)
+                    processor.SetTDPLimit(type, wantedTDP);
 
                 await Task.Delay(12);
             }
 
-            // are we done ?
-            TDPdone = CurrentTDP[0] == StoredTDP[0] && CurrentTDP[1] == StoredTDP[1] && CurrentTDP[2] == StoredTDP[2];
-
             // processor specific
-            if (processor.GetType() == typeof(IntelProcessor))
+            if (processor is IntelProcessor intelProcessor)
             {
                 var TDPslow = (int)StoredTDP[(int)PowerType.Slow];
                 var TDPfast = (int)StoredTDP[(int)PowerType.Fast];
@@ -465,23 +469,7 @@ public class PerformanceManager : Manager
                 // only request an update if current limit is different than stored
                 if (CurrentTDP[(int)PowerType.MsrSlow] != TDPslow ||
                     CurrentTDP[(int)PowerType.MsrFast] != TDPfast)
-                    ((IntelProcessor)processor).SetMSRLimit(TDPslow, TDPfast);
-                else
-                    MSRdone = true;
-            }
-
-            // user requested to halt cpu watchdog
-            if (cpuWatchdogPendingStop)
-            {
-                if (cpuWatchdog.Interval == INTERVAL_DEFAULT)
-                {
-                    if (TDPdone && MSRdone)
-                        cpuWatchdog.Stop();
-                }
-                else if (cpuWatchdog.Interval == INTERVAL_DEGRADED)
-                {
-                    cpuWatchdog.Stop();
-                }
+                    intelProcessor.SetMSRLimit(TDPslow, TDPfast);
             }
 
             // release lock
@@ -498,8 +486,6 @@ public class PerformanceManager : Manager
         {
             // set lock
             gfxLock = true;
-
-            var GPUdone = false;
 
             if (CurrentGfxClock != 0)
                 gfxWatchdog.Interval = INTERVAL_DEFAULT;
@@ -518,28 +504,8 @@ public class PerformanceManager : Manager
             if (CurrentGfxClock != StoredGfxClock)
             {
                 // disabling
-                if (StoredGfxClock == 12750)
-                    GPUdone = true;
-                else
+                if (StoredGfxClock != 12750)
                     processor.SetGPUClock(StoredGfxClock);
-            }
-            else
-            {
-                GPUdone = true;
-            }
-
-            // user requested to halt gpu watchdog
-            if (gfxWatchdogPendingStop)
-            {
-                if (gfxWatchdog.Interval == INTERVAL_DEFAULT)
-                {
-                    if (GPUdone)
-                        gfxWatchdog.Stop();
-                }
-                else if (gfxWatchdog.Interval == INTERVAL_DEGRADED)
-                {
-                    gfxWatchdog.Stop();
-                }
             }
 
             // release lock
@@ -549,30 +515,24 @@ public class PerformanceManager : Manager
 
     internal void StartGPUWatchdog()
     {
-        gfxWatchdogPendingStop = false;
         gfxWatchdog.Interval = INTERVAL_DEFAULT;
         gfxWatchdog.Start();
     }
 
-    internal void StopGPUWatchdog(bool immediate = false)
+    internal void StopGPUWatchdog()
     {
-        gfxWatchdogPendingStop = true;
-        if (immediate)
-            gfxWatchdog.Stop();
+        gfxWatchdog.Stop();
     }
 
     internal void StartTDPWatchdog()
     {
-        cpuWatchdogPendingStop = false;
         cpuWatchdog.Interval = INTERVAL_DEFAULT;
         cpuWatchdog.Start();
     }
 
-    internal void StopTDPWatchdog(bool immediate = false)
+    internal void StopTDPWatchdog()
     {
-        cpuWatchdogPendingStop = true;
-        if (immediate)
-            cpuWatchdog.Stop();
+        cpuWatchdog.Stop();
     }
 
     internal void StartAutoTDPWatchdog()
@@ -580,37 +540,33 @@ public class PerformanceManager : Manager
         autoWatchdog.Start();
     }
 
-    internal void StopAutoTDPWatchdog(bool immediate = false)
+    internal void StopAutoTDPWatchdog()
     {
         autoWatchdog.Stop();
     }
 
-    public void RequestTDP(PowerType type, double value, bool immediate = false)
-    {
-        if (processor is null || !processor.IsInitialized)
-            return;
-
-        // make sure we're not trying to run below or above specs
-        value = Math.Min(TDPMax, Math.Max(TDPMin, value));
-
-        // update value read by timer
-        var idx = (int)type;
-        StoredTDP[idx] = value;
-
-        // immediately apply
-        if (immediate)
-            processor.SetTDPLimit((PowerType)idx, value);
-    }
-
-    public async void RequestTDP(double[] values, bool immediate = false)
+    /// <summary>
+    /// Request TDP limits <paramref name="values"/> be applied
+    /// </summary>
+    /// <remarks>
+    /// <paramref name="values"/> must be an array of exactly length 3, containing TDP limits for
+    /// <see cref="PowerType.Slow"/>, <see cref="PowerType.Stapm"/> and <see cref="PowerType.Fast"/> in that order
+    /// </remarks>
+    /// <param name="values">Array of TDP limits to apply</param>
+    /// <param name="immediate">Whether changes should be applied immediately or wait for next CPU watchdog iteration</param>
+    /// <param name="clamp">Whether values should be clamped to within <see cref="TDPMin"/> and <see cref="TDPMax"/></param>
+    public async void RequestTDP(double[] values, bool immediate = false, bool clamp = true)
     {
         if (processor is null || !processor.IsInitialized)
             return;
 
         for (var idx = (int)PowerType.Slow; idx <= (int)PowerType.Fast; idx++)
         {
-            // make sure we're not trying to run below or above specs
-            values[idx] = Math.Min(TDPMax, Math.Max(TDPMin, values[idx]));
+            if (clamp)
+            {
+                // make sure we're not trying to run below or above specs
+                values[idx] = Math.Min(TDPMax, Math.Max(TDPMin, values[idx]));
+            }
 
             // update value read by timer
             StoredTDP[idx] = values[idx];
@@ -789,14 +745,6 @@ public class PerformanceManager : Manager
 
     #region events
 
-    public event LimitChangedHandler PowerLimitChanged;
-
-    public delegate void LimitChangedHandler(PowerType type, int limit);
-
-    public event ValueChangedHandler PowerValueChanged;
-
-    public delegate void ValueChangedHandler(PowerType type, float value);
-
     public event StatusChangedHandler ProcessorStatusChanged;
 
     public delegate void StatusChangedHandler(bool CanChangeTDP, bool CanChangeGPU);
@@ -834,9 +782,6 @@ public class PerformanceManager : Manager
                 break;
         }
 
-        // raise event
-        PowerLimitChanged?.Invoke(type, limit);
-
         LogManager.LogTrace("PowerLimitChanged: {0}\t{1} W", type, limit);
     }
 
@@ -850,35 +795,6 @@ public class PerformanceManager : Manager
     private void Processor_StatusChanged(bool CanChangeTDP, bool CanChangeGPU)
     {
         ProcessorStatusChanged?.Invoke(CanChangeTDP, CanChangeGPU);
-    }
-
-    [Obsolete("Method is deprecated.")]
-    private void Processor_ValueChanged(PowerType type, float value)
-    {
-        PowerValueChanged?.Invoke(type, value);
-    }
-
-    [Obsolete("Method is deprecated.")]
-    private void Processor_LimitChanged(PowerType type, int limit)
-    {
-        var idx = (int)type;
-        CurrentTDP[idx] = limit;
-
-        // raise event
-        PowerLimitChanged?.Invoke(type, limit);
-    }
-
-    [Obsolete("Method is deprecated.")]
-    private void Processor_MiscChanged(string misc, float value)
-    {
-        switch (misc)
-        {
-            case "gfx_clk":
-            {
-                CurrentGfxClock = value;
-            }
-                break;
-        }
     }
 
     #endregion
